@@ -1,0 +1,393 @@
+---
+title: "Texas Power Outage Analysis"
+author: "Michelle Lam"
+date: "2022-12-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load, include=TRUE, message=FALSE, warning=FALSE}
+#load required packages
+library(terra)
+library(tmap)
+library(stars)
+library(tidyverse)
+library(gridExtra)
+library(tidycensus)
+
+# Set filepath
+rootdir <- ("/Users/michelle/Documents/UCSB Grad School/Courses/eds_223")
+datadir <- file.path(rootdir,"data")
+
+#accessing stored API key for census data
+census_token <- Sys.getenv('CENSUS_KEY')
+census_api_key(census_token)
+```
+
+### Research Questions
+
+#### How many Houston homes lost power as a result of the 2021 winter storms in Texas?
+Is median household income a predictor of community recovery? Were there disproportionate affects on medically vulnerable communities? 
+
+### Background
+
+Severe winter storms hit Texas February 10th through the 20th in 2021, resulting in the "worst energy infrastructure failure in Texas state history".[^1] Millions of homes lost power, resulting in at least 57 deaths and over \$195 billion in property damage.[^2] As climate change increases the frequency and severity of natural disasters that lead to power outages, environmental justice concerns arise around community recovery and resiliency. Studies have shown median household income to be significant predictors of recovery time [^3] and power outages place electricity-dependent individuals (e.g. those with disabilities needing electricity to run medical equipment or refrigeration to store medicine) at higher risk for adverse health outcomes.[^4] Focusing analysis on Houston, the most populous city in Texas [^5], we can use overlay spatial data to quantify how many residents lost power and the potential socioeconomic disparities in those affected by the power outage. 
+
+[^1]: Wikipedia. 2021. "2021 Texas power crisis." Last modified October 2, 2021. <https://en.wikipedia.org/wiki/2021_Texas_power_crisis>.
+
+[^2]:  King, Carey W, et al. “The Timeline and Events of the February 2021 Texas Electric Grid Blackouts.” Energy Institute | The University of Texas at Austin, July 2021, https://energy.utexas.edu/research/ercot-blackout-2021. 
+
+[^3]: Best, Kelsea, et al. "Spatial regression identifies socioeconomic inequality in multi-stage power outage recovery after Hurricane Isaac." (2022).
+
+[^4]: Casey, J.A., Fukurai, M., Hernández, D. et al. Power Outages and Community Health: a Narrative Review. Curr Envir Health Rpt 7, 371–383 (2020). https://doi.org/10.1007/s40572-020-00295-0
+
+[^5]: Cubit. “Texas Cities by Population.” Texas Outline, 2022, https://www.texas-demographics.com/cities_by_population. 
+
+### Data
+
+#### VIIRS data from NASA
+
+To determine which areas experienced an outage, VIIRS data distributed through NASA's [Level-1 and Atmospheric Archive & Distribution System Distributed Active Archive Center (LAADS DAAC)](https://ladsweb.modaps.eosdis.nasa.gov/) is utilized. After filtering out images with too much cloud cover, 2021-02-07 (pre outage) and 2021-02-16 (post outage) provide two clear, contrasting images to visualize the extent of the power outage in Texas.
+
+This NASA Earth data product is distributed in 10x10 degree tiles in sinusoidal equal-area projection. Tiles are identified by their horizontal and vertical position in the grid. Houston lies on the border of tiles h08v05 and h08v06, so there will be two tiles per date. 
+
+```{r}
+#load in night lights tiles from 2021-02-07 
+night_lights1 <- read_stars(file.path(datadir,"VNP46A1","VNP46A1.A2021038.h08v05.001.2021039064328.tif"))
+
+night_lights2 <- read_stars(file.path(datadir,"VNP46A1","VNP46A1.A2021038.h08v06.001.2021039064329.tif"))
+
+#combine tiles for 2021-02-07 
+combined_feb_7 <- st_mosaic(night_lights1, night_lights2)
+
+#plot to see what the combined Feb 7 tiles look like
+plot(combined_feb_7)
+
+#load in night lights tiles from 2021-02-16
+night_lights3 <- read_stars(file.path(datadir,"VNP46A1","VNP46A1.A2021047.h08v05.001.2021048091106.tif"))
+
+night_lights4 <- read_stars(file.path(datadir,"VNP46A1","VNP46A1.A2021047.h08v06.001.2021048091105.tif"))
+
+#combine tiles for 2021-02-16
+combined_feb_16 <- st_mosaic(night_lights3, night_lights4)
+
+#plot to see what the combined Feb 16 tiles look like
+plot(combined_feb_16)
+
+```
+
+#### OpenStreetMap Data
+
+[OpenStreetMap (OSM)](https://planet.openstreetmap.org/) is a project that provides free, publicly available geographic data of the world. This analysis uses OSM roads and building data taken from [Geofabrik's download sites](https://download.geofabrik.de/). Roads and building data are shapefiles that are provided via a Geopackage (.gpkg file). 
+
+##### Highways/Roads
+
+Because highways account for a large portion of the night lights observable from space, areas near highways are ignored in order to minimize falsely identifying areas with reduced traffic as areas without power. 
+
+```{r}
+#define the SQL query and load in highways dataset
+query <- "SELECT * FROM gis_osm_roads_free_1 WHERE fclass='motorway'"
+highways <- st_read(file.path(datadir,"gis_osm_roads_free_1.gpkg"), query = query)
+
+#reproject highways data to EPSG: 3083
+highways <- st_transform(highways, crs = 3083)
+```
+
+##### Buildings/Houses
+
+To understand which houses were effected by the power outages, a spatial dataset indicating locations of houses for the Houston metropolitan area is utilized. 
+
+```{r}
+#define buildings_query and load in buildings dataset
+buildings_query <- "SELECT * FROM gis_osm_buildings_a_free_1 WHERE (type IS NULL AND name IS NULL) OR type in ('residential', 'apartments', 'house', 'static_caravan', 'detached')"
+
+buildings <- st_read(file.path(datadir,"gis_osm_buildings_a_free_1.gpkg"), query = buildings_query)
+
+#reproject buildings data to EPSG: 3083
+buildings <- st_transform(buildings, crs = 3083)
+```
+
+#### American Community Survey (ACS) Data
+
+[American Community Survey (ACS)](https://www.census.gov/programs-surveys/acs) is a demographics survey program conducted by the U.S. Census Bureau. This program gathers information on a regular, more frequent, basis than the long form decennial census. 
+
+##### Median Household Income
+
+2019 median household income data for each census tract in the Houston area is utilized to understand how socioeconomic factors might play a role in a communities ability to recover from power outages. Income data is provided through an ArcGIS ["file geodatabase"](https://desktop.arcgis.com/en/arcmap/latest/manage-data/administer-file-gdbs/file-geodatabases.htm). The geodatabase includes layers holding ACS attributes and a separate layer holding the geometry information. 
+
+```{r}
+#read in the geometries layer of the ACS data and reproject to EPSG: 3083
+acs_geom <- st_read(file.path(datadir, "ACS_2019_5YR_TRACT_48_TEXAS.gdb"), layer = "ACS_2019_5YR_TRACT_48_TEXAS")
+acs_geom <- st_transform(acs_geom, crs = 3083)
+
+#read in the income layer of the ACS data
+acs_income <- st_read(file.path(datadir, "ACS_2019_5YR_TRACT_48_TEXAS.gdb"), layer = "X19_INCOME")
+
+#keep only GEOID and B19013e1 column in the ACS income data, rename B19013e1 column to median income
+acs_income_clean <- acs_income |> 
+  select(c("GEOID", "B19013e1")) |> 
+  rename("median_income" = "B19013e1")
+```
+
+##### Medical Vulnerability 
+
+The one or more disability items allocated attribute in combination with census tract population from the 2020 ACS is used to see if impacted tracts have a higher population of medically vulnerable people. This data will be accessed through an API and tidycensus package in R. Tidycensus returns a dataframe with desired attribute and geometry column. 
+
+```{r}
+#access ACS data variables for 2020 year 
+v20 <- load_variables(2020, "acs5", cache = TRUE)
+
+population <- get_acs(
+  state = "Texas",
+  geography = "tract",
+  variables = "B99181_001",
+  geometry = TRUE, 
+  year = 2020
+)
+
+population_clean <- population |> 
+  select("GEOID", "NAME", "estimate", "geometry") |> 
+  rename(population = "estimate")
+
+disability <- get_acs(
+  state = "Texas", 
+  geography = "tract",
+  variables = "B99181_002",
+  geometry = TRUE, 
+  year = 2020
+)
+
+disability_clean <- disability |> 
+  select("GEOID", "NAME", "estimate", "geometry") |> 
+  rename(disabled = "estimate")
+
+acs_disability <- cbind(disability_clean, population_clean$population) |> 
+  rename(population = "population_clean.population") |> 
+  mutate(percent_disabled = (disabled/population)*100)
+
+acs_disability <- st_transform(acs_disability, crs = 3083)
+```
+
+### Analysis
+
+In order to find the homes that were impacted by the blackout, I created a blackout mask by doing some map algebra. I subtract the February 16th raster from the February 7th raster to get a raster containing the change in night lights intensity. I assume that any location that had a drop of more than nW cm^-2^sr^-1^ experienced a blackout. Under this assumption, I recalssify the change in night lights intensity raster so that any location with a blackout holds a value of 1 and anywhere else is NA. Then, I vectorize the mask and crop the mask to the area of interest (in this case the Houston metropolitan area). Here are the coordinates used (-96.5, 29), (-96.5, 30.5), (-94.5, 30.5), (-94.5, 29). To account for the roads and highways, I create a 200m buffer around each highway and exclude them from the blackout mask. Lastly, I use spatial join the blackout mask with the buildings data to get the number of homes that experienced a blackout. 
+
+In order to investigate if median household income is a predictor for recovery, income data is joined to census tract geometries and the blackout mask that was utilized in the analysis above is used to find which census tracts experienced blackouts. The distribution of income in the impacted vs unimpacted tracts can then be compared and a map can be produced to visualize the findings. 
+
+In order to explore if impacted tracts had a higher percentage of people with disabilities, I spatially intersected disability data from ACS with the blackout mask created in the first part of the analysis. This resulting sf object can then be utilized to map relative percentages of disabled people in each census tract and impacted census tracts. Additionally, I visualized the distribution of percent disabled census tracts and calculated the average percent disabled in impacted vs. unimpacted tracts. 
+
+#### Create blackout mask and vectorize it
+```{r}
+#Find the difference between the two rasters (subtracting feb 16 from feb 7 values to get positive values - i.e. nW cm^-2sr^-1 is higher on feb 7 than on feb 16)
+change_nli <- combined_feb_7-combined_feb_16
+
+#check out the change_nli object to see the min and max values
+change_nli
+
+#create a reclassification matrix
+#set lowest value in range to -3120 and highest to 3000 based on the min and max values of the change_nli object
+#a drop of less than 200 becomes 0 (i.e. no blackout), a drop of more than 200 becomes 1 (i.e.  blackout)
+rcl_matrix <- data.frame(from = c(-3120,200), to = c(199, 3000), becomes = 0:1)
+rcl_matrix
+
+#reclassify the change_nli with the matrix created above. 
+rcl_change_nli <- cut(change_nli, breaks = c(-3200, rcl_matrix$to), labels = rcl_matrix$becomes)
+rcl_change_nli
+
+#set 0 (non blackout areas) to NAs 
+rcl_change_nli[rcl_change_nli == 0] = NA
+
+#plot the reclassified change_nli object
+plot(rcl_change_nli)
+
+#vectorize the blackout mask
+vect_mask <- st_as_sf(rcl_change_nli) |> 
+  st_make_valid()
+
+```
+
+#### Crop vectorized map to region of interest
+
+```{r}
+#define Houston area
+houston_coord <- rbind(c(-96.5, 29), c(-94.5, 29), c(-94.5, 30.5), c(-96.5,30.5), c(-96.5, 29))
+
+#turn Houston coordinates into a polygon
+houston_poly <- st_polygon(list(houston_coord))
+
+#checkout the CRS of the vect_mask
+crs(vect_mask)
+
+#convert Houston polygon to simple feature collection and assign the CRS to EPSG: 4326 (same CRS as the vect_mask)
+houston_geom <- st_sfc(houston_poly, crs = 4326)
+
+#crop blackout mask to region of interest and reproject to EPSG: 3083
+blackout_mask_crop <- vect_mask[houston_geom,] |> 
+  st_transform(crs = 3083)
+
+#map cropped blackout mask
+tm_shape(blackout_mask_crop) +
+  tm_polygons(col = "black") +
+  tm_layout(main.title = "Houston Feb 2021 Blackout Areas")
+```
+
+#### Exclude highways from blackout mask 
+
+```{r}
+#remove unnecessary columns of highways data frame to create a smaller highways dataframe so it doesn't crash R
+highways_clean <- highways$geom
+
+#create a 200m buffer around highways and reproject to EPSG: 3083
+highway_buffer <- st_union(st_buffer(highways_clean, dist = 200))
+
+#find areas that experienced blackouts further than 200m from a highway (note: I used st_disjoint to make sure that houses touching the buffer were not included. Alternatively, you could use st_difference and get houses that touch or are on the buffer line.)
+blackout_highway <- blackout_mask_crop[highway_buffer, ,op = st_disjoint]
+
+#map
+tm_shape(blackout_highway) +
+  tm_polygons(col = "black") +
+  tm_shape(highway_buffer) +
+  tm_borders(col = "mediumorchid4") +
+  tm_layout(main.title = "Houston Feb 2021 Blackout Areas with Highway Buffers", main.title.size = 1)
+
+#find homes within blackout areas
+blackout_homes <- buildings[blackout_highway,]
+
+#count number of impacted homes
+nrow(blackout_homes)
+print(paste0("There are ", nrow(blackout_homes), " homes in the blackout area."))
+```
+
+#### Determine which census tracts experience blackouts
+
+```{r}
+#join income data to census tract geometries
+acs_combined <- left_join(acs_geom, acs_income_clean, by = c("GEOID_Data" = "GEOID"))
+
+#spatially join census tract data with blackout_homes dataset to get a data frame of census tracts with blackouts, keep only the GEOID_Data and median income, and add a blackout column (used later on for a left_join)
+blackout_acs <- acs_combined[blackout_homes,] |> 
+  select(c("GEOID_Data", "median_income")) |> 
+  mutate(blackout = "blackout") 
+
+#map which census tracts had blackouts
+tm_shape(blackout_acs) +
+  tm_polygons(col = "orchid4", border.col = "black") +
+  tm_layout(main.title = "Houston Census Tracts Impacted by Feb 2021 Blackouts", main.title.size = 1.2)
+```
+
+#### Compare Income of impacted tracts to unimpacted tracts
+
+```{r}
+#make the acs_combined dataset smaller for quicker processing
+acs_combined_clean <- acs_combined |> 
+  select(c("median_income", "Shape", "GEOID_Data"))
+
+#reproject houston_geom to EPGS: 3083
+houston_geom_3083 <- st_transform(houston_geom, crs = 3083)
+
+#filter census tract data to Houston extent
+acs_houston <- acs_combined_clean[houston_geom_3083,]
+
+#create map of median income by census tract, designating blackout tracts
+tmap_mode("view")
+tm_shape(acs_houston) +
+  tm_polygons(col = "median_income", title = "Median Income") +
+  tm_shape(blackout_acs) +
+  tm_dots(title = "Blackout Tracts", col = "blackout", palette = c("black"), legend.show = TRUE) +
+  tm_layout(main.title = "Houston Median Income and Feb 2021 Blackouts")
+
+#in order to create a data frame of census tracts in Houston that show which experienced blackouts and which did not, I need to create a new blackout_acs_nogeom dataframe with the geometries dropped in order to left join it to the acs_houston data frame
+#remove median income from the new blackout_acs data frame since it already exists in the acs_houston data frame
+blackout_acs_nogeom <- st_drop_geometry(blackout_acs) |> 
+  select(c("GEOID_Data", "blackout"))
+
+#create the combined data frame (showing blackout and no blackout tracts in Houston)
+blackout_acs_combined <- left_join(acs_houston, blackout_acs_nogeom, by = "GEOID_Data") |> 
+  mutate(blackout = if_else(is.na(blackout), "no blackout", "blackout"))
+
+#plot distribution of income in impacted vs. unimpacted tracts
+ggplot(data = blackout_acs_combined, aes(x = blackout, y = median_income, col = blackout)) +
+  geom_jitter(width = 0.1) +
+  geom_boxplot(alpha = 0.5) +
+  labs(x = "Blackout", y = "Median Income", title = "Houston Power Outage Median Income Distribution")
+
+#split the blackout_acs_combined data frame into two based on blackout and no blackout to plot the separate histograms
+no_blackout <- blackout_acs_combined |> 
+  filter(blackout == "no blackout")
+
+blackout <- blackout_acs_combined|> 
+  filter(blackout == "blackout")
+
+#create histogram of income in impacted tracts
+impacted_tracts <- ggplot(data = blackout, aes(x = median_income)) +
+  geom_histogram(fill = "darkorchid") +
+  labs(x = "Median Income", title = "Median Income Impacted Tracts") +
+  theme_minimal()
+
+#create histogram of income in unimpacted tracts
+unimpacted_tracts <- ggplot(data = no_blackout, aes(x = median_income)) +
+  geom_histogram(fill = "forestgreen") +
+  labs(x = "Median Income", title = "Median Income Unimpacted Tracts") +
+  theme_minimal()
+
+#put the histograms side by side
+grid.arrange(impacted_tracts, unimpacted_tracts, ncol = 2, nrow = 1)
+
+#calculate the average median income in the impacted vs. unimpacted census tracts
+acs_houston_summary <- blackout_acs_combined |> 
+  group_by(blackout) |> 
+  summarize(average_income = mean(median_income, na.rm = TRUE))
+
+print(acs_houston_summary)
+```
+
+#### Compare disability percentage in impacted vs unimpacted
+
+```{r}
+#spatially join census tract data with blackout_homes dataset to get a data frame of census tracts with blackouts, keep only the GEOID and disability percent, and add a blackout column (used later on for a left_join)
+blackout_acs_disabled <- acs_disability[blackout_homes,] |> 
+  select(c("GEOID", "percent_disabled")) |> 
+  mutate(blackout = "blackout")
+
+#filter census tract disability data to Houston extent
+acs_disability_houston <- acs_disability[houston_geom_3083,]
+
+#create map of disability percentage by census tract, designating blackout tracts
+tm_shape(acs_disability_houston) +
+  tm_polygons(col = "percent_disabled", title = "Percent Disabled", style = "fixed", breaks = c(0,5,10,20,100), palette = "Blues") +
+  tm_shape(blackout_acs_disabled) +
+  tm_dots(title = "Blackout Tracts", col = "blackout", palette = c("black"), legend.show = TRUE) +
+  tm_layout(main.title = "Houston Percent Disabled and Feb 2021 Blackouts")
+
+#drop geometry
+blackout_acs_disabled_nogeom <- st_drop_geometry(blackout_acs_disabled) |> 
+  select(-"percent_disabled")
+
+#create combined dataframe of blackout and non blackout tracts
+blackout_acs_disabled_combined <- left_join(acs_disability_houston, blackout_acs_disabled_nogeom, by = "GEOID") |> 
+  mutate(blackout = if_else(is.na(blackout), "no blackout", "blackout"))
+
+#plot distribution of disability percentage in impacted vs. unimpacted tracts
+ggplot(data = blackout_acs_disabled_combined, aes(x = blackout, y = percent_disabled, col = blackout)) +
+  geom_jitter(width = 0.1) +
+  geom_boxplot(alpha = 0.5) +
+  labs(x = "Blackout", y = "Percent Disabled", title = "Houston Power Outage Disabled Percentage Distribution")
+
+mean_disability <- blackout_acs_disabled_combined |> 
+  group_by(blackout) |> 
+  summarize("mean disabled percentage" = mean(percent_disabled, na.rm = TRUE)) |> 
+  st_drop_geometry()
+```
+
+### Results
+
+I have calculated a total of 139,103 houses in Houston that lost power as a result of the first two storms. The resulting distributions and calculated averages of impacted vs. unimpacted tracts' median household income show that impacted tracts had a slightly higher median income (average = \$71,462) than the unimpacted census tracts (average = \$67,436). This seems a little counter intuitive, but when looking at the data more closely I can see there are a higher number of outliers (i.e. more households with the \$250,000 income range) in the impacted tracts which could be pulling the average up. Additionally, when examining if there is a difference in disabled percent across unimpacted vs. impacted tracts, this initial analysis shows no real difference. The calculated mean percent disabled in the impacted tracts is 10.59 and in unimpacted it is 10.62. 
+
+### Discussion
+
+Without further statistical analysis, it is hard to say if median household income is a predictor of communities recovery from a power outages. However, from this short analysis, it seems like census tracts that experienced power outages were not more likely to contain a higher percentage of disabled individuals.
+
+Some limitations of this study include only having satellite imagery for 2 days, missing data for median income, and assumptions of a 200m buffer for highways and that a drop of 200 nW cm^-2^sr^-1^ constitutes a blackout. Disability data from ACS may not be an equivalent proxy for those that are electricity-dependent so future analysis could include more precise data on people that utilize rely on electric-powered medical equipment. Other indicators of recovery that would be interesting to look at include race/ethnicity and home age. 
